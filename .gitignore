@@ -216,3 +216,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project specific - Configuration files
+*.json
+!.vscode/*.json
+!package.json
+!tsconfig.json
+accounts.json
+tokens.json
+config.json
+
+# Project specific - Environment files
+.env
+.env.*
+!.env.example
+
+# Project specific - Examples and pool subprojects
+examples/
+pool/
+test_*.py
+*.log
+/example
