@@ -237,3 +237,4 @@ pool/
 test_*.py
 *.log
 /example
+CHANGELOG.md
