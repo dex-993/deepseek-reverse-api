@@ -18,7 +18,19 @@ class DeepSeekClient:
         """
         self.adapter = DeepSeekAdapter(token, use_proxy=use_proxy)
         self._session_id: Optional[str] = None
-    
+
+    def _messages_to_text(self, messages: List[Dict]) -> str:
+        """将消息列表转换为文本，用于 token 计数"""
+        parts = []
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                content = ' '.join(item.get('text', '') for item in content if item.get('type') == 'text')
+            if content:
+                parts.append(f"{role}: {content}")
+        return '\n'.join(parts)
+
     def chat_completions(
         self,
         model: str,
@@ -81,6 +93,9 @@ class DeepSeekClient:
         
         self._session_id = session_id
 
+        # 生成 prompt 文本用于 token 计数
+        prompt_text = self._messages_to_text(processed_messages)
+
         handler = DeepSeekStreamHandler(
             model,
             session_id,
@@ -92,7 +107,7 @@ class DeepSeekClient:
         if stream:
             return handler.handle_stream(response)
         else:
-            return handler.handle_non_stream(response)
+            return handler.handle_non_stream(response, prompt_text)
     
     def _on_stream_end(self, auto_delete_session: bool):
         """Handle stream end callback"""

@@ -4,8 +4,24 @@ Converts DeepSeek SSE stream to OpenAI compatible format
 
 import json
 import re
+import tiktoken
 from typing import Dict, Any, Optional, Callable, Generator
 from .tool_parser import ToolParser
+
+# 全局 encoder 实例，避免重复初始化
+_encoder = None
+
+def get_encoder():
+    global _encoder
+    if _encoder is None:
+        _encoder = tiktoken.get_encoding("cl100k_base")
+    return _encoder
+
+def count_tokens(text: str) -> int:
+    """估算文本的 token 数量"""
+    if not text:
+        return 0
+    return len(get_encoder().encode(text))
 
 
 class DeepSeekStreamHandler:
@@ -29,6 +45,8 @@ class DeepSeekStreamHandler:
         self.current_path = ''
         self.search_results = []
         self.thinking_started = False
+        self.accumulated_content = ''
+        self.accumulated_thinking = ''
         self.accumulated_token_usage = 2
         self.created = int(__import__('time').time())
         self.tool_call_buffer = ''
@@ -45,6 +63,21 @@ class DeepSeekStreamHandler:
                 'delta': delta,
                 'finish_reason': finish_reason or None,
             }],
+            'created': self.created,
+        })
+
+    def _create_usage_chunk(self) -> str:
+        """Create a chunk with usage information"""
+        return json.dumps({
+            'id': f'{self.session_id}@{self.message_id}',
+            'model': self.model,
+            'object': 'chat.completion.chunk',
+            'choices': [{
+                'index': 0,
+                'delta': {},
+                'finish_reason': 'stop',
+            }],
+            'usage': self._build_usage(),
             'created': self.created,
         })
     
@@ -80,23 +113,41 @@ class DeepSeekStreamHandler:
             try:
                 parsed = json.loads(data)
                 chunk = self._process_chunk(
-                    parsed, 
-                    is_thinking_model, 
-                    is_silent_model, 
-                    is_fold_model, 
+                    parsed,
+                    is_thinking_model,
+                    is_silent_model,
+                    is_fold_model,
                     is_search_silent_model
                 )
                 if chunk:
                     yield f'data: {chunk}\n\n'
+
+                    # 累加内容用于 token 估算 (流式)
+                    if isinstance(chunk, str):
+                        try:
+                            chunk_data = json.loads(chunk)
+                            delta = chunk_data.get('choices', [{}])[0].get('delta', {})
+                            if delta.get('content'):
+                                self.accumulated_content += delta['content']
+                            if delta.get('reasoning_content'):
+                                self.accumulated_thinking += delta['reasoning_content']
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            pass
             except json.JSONDecodeError:
                 continue
-        
+
         # Send final chunk
         final_chunk = self._handle_done(is_fold_model, is_search_silent_model)
         if final_chunk:
             yield f'data: {final_chunk}\n\n'
+
+        # 发送包含 usage 的最终 chunk
+        usage_chunk = self._create_usage_chunk()
+        if usage_chunk:
+            yield f'data: {usage_chunk}\n\n'
+
         yield 'data: [DONE]\n\n'
-        
+
         if self.on_end:
             self.on_end()
     
@@ -270,10 +321,10 @@ class DeepSeekStreamHandler:
     def _handle_done(self, is_fold_model: bool, is_search_silent_model: bool) -> Optional[str]:
         """Handle stream end"""
         delta = {}
-        
+
         if is_fold_model and self.thinking_started:
             delta['content'] = '</pre></details>'
-        
+
         # Add citations if available
         if self.search_results and not is_search_silent_model:
             citations = []
@@ -283,22 +334,52 @@ class DeepSeekStreamHandler:
                 url = result.get('url', '')
                 if cite_index:
                     citations.append(f'[{cite_index}]: [{title}]({url})')
-            
+
             if citations:
                 citation_text = '\n\n' + '\n'.join(citations)
                 if 'content' in delta:
                     delta['content'] += citation_text
                 else:
                     delta['content'] = citation_text
-        
+
         finish_reason = 'tool_calls' if self.has_tool_call else 'stop'
-        
-        if delta:
-            return self._create_chunk(delta, finish_reason)
-        else:
-            return self._create_chunk({}, finish_reason)
+
+        return self._create_chunk(delta, finish_reason)
+
+    def _build_usage(self, prompt_text: str = '') -> Dict[str, int]:
+        """计算 token 用量"""
+        prompt_tokens = count_tokens(prompt_text) if prompt_text else 1
+        completion_tokens = count_tokens(self.accumulated_content)
+        # 思考过程的 token 也计入
+        thinking_tokens = count_tokens(self.accumulated_thinking)
+        completion_tokens += thinking_tokens
+
+        return {
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens or 1,
+            'total_tokens': prompt_tokens + completion_tokens
+        }
+
+    def get_final_response(self, prompt_text: str = '') -> Dict:
+        """获取完整响应（含精确 usage）"""
+        return {
+            'id': f'{self.session_id}@{self.message_id}',
+            'model': self.model,
+            'object': 'chat.completion',
+            'choices': [{
+                'index': 0,
+                'message': {
+                    'role': 'assistant',
+                    'content': self.accumulated_content.strip() if not self.has_tool_call else None,
+                    'reasoning_content': self.accumulated_thinking.strip() or None,
+                },
+                'finish_reason': 'tool_calls' if self.has_tool_call else 'stop',
+            }],
+            'usage': self._build_usage(prompt_text),
+            'created': self.created,
+        }
     
-    def handle_non_stream(self, response) -> Dict:
+    def handle_non_stream(self, response, prompt_text: str = '') -> Dict:
         """Handle non-streaming response"""
         accumulated_content = ''
         accumulated_thinking = ''
@@ -394,21 +475,27 @@ class DeepSeekStreamHandler:
             
             except json.JSONDecodeError:
                 continue
-        
+
         # Parse tool calls from content
         clean_content, tool_calls = ToolParser.parse_tool_calls_from_text_with_content(accumulated_content)
-        
+
         message = {
             'role': 'assistant',
             'content': clean_content.strip() if not tool_calls else None,
         }
-        
+
         if accumulated_thinking.strip():
             message['reasoning_content'] = accumulated_thinking.strip()
-        
+
         if tool_calls:
             message['tool_calls'] = tool_calls
-        
+
+        # 估算 token 用量
+        prompt_tokens = count_tokens(prompt_text) if prompt_text else 1
+        completion_tokens = count_tokens(accumulated_content)
+        thinking_tokens = count_tokens(accumulated_thinking)
+        completion_tokens += thinking_tokens
+
         return {
             'id': f'{self.session_id}@{message_id}',
             'model': self.model,
@@ -419,9 +506,9 @@ class DeepSeekStreamHandler:
                 'finish_reason': 'tool_calls' if tool_calls else 'stop',
             }],
             'usage': {
-                'prompt_tokens': 1,
-                'completion_tokens': 1,
-                'total_tokens': self.accumulated_token_usage
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens or 1,
+                'total_tokens': prompt_tokens + completion_tokens
             },
             'created': self.created,
         }
